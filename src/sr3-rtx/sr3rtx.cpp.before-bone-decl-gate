@@ -200,11 +200,6 @@ struct Settings {
     bool clothDump = false;      // write the first 3 outfits and their patterns out as raw RGB
     bool charTexDump = false;    // write every named stage of the probed character materials
     int captureKey = 0x78;       // VK_F9: re-arm the frame and shape dumps, 0 disables
-    // Refuse to read a bone palette for a draw whose vertex shader declares no BLENDINDICES
-    // input. Such a shader places the mesh by objTM alone; posing it costs a bone matrix that
-    // belongs to whatever was drawn before. 0 restores the old fallback-to-c52 behaviour, which
-    // is what makes this a controlled experiment rather than an assertion.
-    int skinRequireBoneDecl = 1;
     int skinRingMB = 8;          // size of the CPU-skinning ring; larger means fewer wraps
     bool forceOcclusionVisible = false;  // answer the engine's occlusion queries "fully visible"
     bool rejectStaleBones = true;  // drop bone influences belonging to a different object
@@ -272,7 +267,6 @@ void LoadSettings() {
     g_settings.clothDump = flag("clothDump", false);
     g_settings.charTexDump = flag("charTexDump", false);
     g_settings.captureKey = num("captureKey", 0x78);
-    g_settings.skinRequireBoneDecl = num("skinRequireBoneDecl", 1);
     g_settings.skinRingMB = num("skinRingMB", 8);
     g_settings.forceOcclusionVisible = flag("forceOcclusionVisible", false);
     g_settings.rejectStaleBones = flag("rejectStaleBones", true);
@@ -488,29 +482,6 @@ struct ShaderInfo {
     // else - so a rigid part is dragged bodily toward a character and follows it. Every vertex
     // shares the indices, which is why the mesh translates without deforming.
     bool usesBlendWeights = false;
-    // Does this vertex shader consume BLENDINDICES at all?
-    //
-    // This is the question that decides whether a draw is skinned, and it is NOT the same as
-    // "the vertex declaration carries BLENDINDICES". Disassembled 2026-08-26, the car body and
-    // car glass ship in two variants over the SAME mesh:
-    //
-    //   ir_sr3cardiffusespec_g_v   dcl_position v0 / dcl_normal v1 / dcl_blendindices v2
-    //                              mul r2.x, c0.z, v2.x / mova a0.x, r2.x
-    //                              dp4 r0.x, c52[a0.x], r1      <- bone, THEN objTM
-    //
-    //   ir_sr3cardiffusespec_g_s   dcl_position v0 / dcl_normal v1     <- no blendindices
-    //                              dp4 r1.x, c32, r0            <- objTM alone
-    //
-    // The static variant does not read a palette, does not declare one, and places the mesh by
-    // objTM only. The declaration is shared with the vehicle variant, so it still carries
-    // BLENDINDICES - which is all the shim looked at. boneReg is then -1, the code below fell
-    // back to c52, and the part was posed by whatever palette the last CHARACTER draw left
-    // there. That is a detached bumper following an NPC's skeleton while its physics body sits
-    // exactly where it belongs, which is the reported bug verbatim.
-    //
-    // Read from the dcl stream, not from the constant table: a shader that declares no input
-    // cannot index a palette no matter what CTAB parsing does or fails to do.
-    bool usesBlendIndices = false;
     bool isPixelShader = false;
     bool anySampler = false;
     // The sampler that WON the albedo ranking, not merely the first one declared. The tiling
@@ -674,8 +645,6 @@ ShaderInfo ReflectShader(const DWORD* tokens) {
                 const DWORD regType = ((t[2] & 0x70000000) >> 28) | ((t[2] & 0x00001800) >> 8);
                 if (usage == 1 /* D3DDECLUSAGE_BLENDWEIGHT */ && regType == 1 /* INPUT */)
                     result.usesBlendWeights = true;
-                if (usage == 2 /* D3DDECLUSAGE_BLENDINDICES */ && regType == 1 /* INPUT */)
-                    result.usesBlendIndices = true;
             }
             // A comment block - CTAB is one, and it sits immediately after the version token -
             // carries its length in bits 16-30, NOT in the 24-27 field the instructions use.
@@ -5449,10 +5418,6 @@ unsigned g_skinRingWraps = 0, g_skinRingDiscards = 0;
 // Timed separately, "is the ring's SIZE costing us frames?" stops being an inference from the
 // shape of a sawtooth and becomes a number.
 double g_skinLockDiscardMs = 0.0, g_skinLockKeepMs = 0.0, g_skinLockWorstMs = 0.0;
-// Draws whose vertex shader reads no BLENDINDICES: not skinned by the game, whatever the
-// vertex declaration says. Counted apart from g_skinC52BoneReg, which lumps "declared at c52"
-// together with "declared nowhere, defaulted to c52" and so reported this bug as clean.
-unsigned g_skinNoBoneDecl = 0, g_skinNoBoneDeclReports = 0;
 UINT g_skinRingHighWater = 0;
 UINT g_skinRingPos = 0;
 bool g_skinRingFresh = true;   // next lock must DISCARD
@@ -5846,17 +5811,6 @@ bool SkinAndBind(IDirect3DDevice9* dev, INT baseVertex, UINT minIndex, UINT numV
     const UINT boneBase = (g_curVS.boneReg >= 0)
         ? static_cast<UINT>(g_curVS.boneReg) : kRegBonePalette;
     if (boneBase != kRegBonePalette) ++g_skinForeignBoneReg; else ++g_skinC52BoneReg;
-    // Name the draws whose shader reads no BLENDINDICES. These are the ones that were being
-    // posed from a stranger's palette; the sampler identifies which mesh so the finding can be
-    // checked against what is visibly wrong on screen rather than taken on trust.
-    if (!g_curVS.usesBlendIndices && g_skinNoBoneDeclReports < 10) {
-        ++g_skinNoBoneDeclReports;
-        Log("NO BONE DECL #%u: ps='%s' verts=%u - this vertex shader declares no "
-            "BLENDINDICES input and places the mesh by objTM alone. boneReg=%d. %s",
-            g_skinNoBoneDeclReports, g_curPS.albedoSampler, numVertices, g_curVS.boneReg,
-            g_settings.skinRequireBoneDecl ? "Left in its bind pose (correct)."
-                                           : "STILL reading c52 (skinRequireBoneDecl=0).");
-    }
     if (g_skinBoneRegSeen < 8 && boneBase != kRegBonePalette) {
         ++g_skinBoneRegSeen;
         Log("BONE REGISTER: ps='%s' declares Bone_weights at c%u, NOT c52 - every draw of this "
@@ -5921,15 +5875,8 @@ bool SkinAndBind(IDirect3DDevice9* dev, INT baseVertex, UINT minIndex, UINT numV
         float sum = 0.0f;
         // A shader that declares no blendweight input uses exactly ONE bone - index component 0,
         // implicit weight 1. Blending the other three would mix in bones the game never reads.
-        // A shader with no BLENDINDICES input indexes no palette: 0 influences, so the vertex
-        // falls through to the bind-pose path below and objTM places it - which is exactly and
-        // only what the game's own static variant does.
-        const bool reads = g_curVS.usesBlendIndices || !g_settings.skinRequireBoneDecl;
-        const int influences = !reads ? 0 : (g_curVS.usesBlendWeights ? 4 : 1);
-        if (i == 0) {
-            if (!reads) ++g_skinNoBoneDecl;
-            else if (influences == 1) ++g_skinSingleBone; else ++g_skinFourBone;
-        }
+        const int influences = g_curVS.usesBlendWeights ? 4 : 1;
+        if (i == 0) { if (influences == 1) ++g_skinSingleBone; else ++g_skinFourBone; }
         for (int k = 0; k < influences; ++k) {
             // Reject on WEIGHT, not index: slot 255 is the "unused" sentinel and would address
             // c817, far outside the 192-register palette.
@@ -6708,11 +6655,6 @@ HRESULT WINAPI Hook_Present(IDirect3DDevice9* dev, const RECT* src, const RECT* 
         Log("        SHADER BLEND FORM: %.1f draws/frame four-bone weighted (characters), "
             "%.1f draws/frame SINGLE unweighted bone (vehicles/rigid attachments)",
             g_skinFourBone / f, g_skinSingleBone / f);
-        // Separated from the two blend forms on purpose: these draws are not skinned by the
-        // game at all. Non-zero here with the drift gone is the whole explanation.
-        Log("        NO BONE DECL: %.1f draws/frame whose vertex shader reads no BLENDINDICES "
-            "(placed by objTM alone, palette not read) - gate %s",
-            g_skinNoBoneDecl / f, g_settings.skinRequireBoneDecl ? "ON" : "OFF");
         Log("        RIGID BONE OWNERSHIP: %.1f/frame use a bone written under their OWN objTM, "
             "%.1f/frame use one written under a DIFFERENT object's",
             g_rigidOwnObject / f, g_rigidForeignObject / f);
